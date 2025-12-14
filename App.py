@@ -27,7 +27,7 @@ import copy
 # ============================================================
 # הגדרות API
 # ============================================================
-GEMINI_API_KEY = "AIzaSyAIrtYWnNo2mYoNgNGTdorj_rPZ_2gfTN8"
+GEMINI_API_KEY = "AIzaSyBcAax-J6DSaPvbB4vRPt7vuOFALczv5dw"
 genai.configure(api_key=GEMINI_API_KEY)
 
 
