@@ -991,8 +991,8 @@ def call_gemini_with_retry(
     model: genai.GenerativeModel,
     prompt: str,
     max_retries: int = 3,
-    base_delay: float = 3.0,
-    retry_delay: float = 15.0
+    base_delay: float = 5.0,
+    retry_delay: float = 30.0
 ) -> tuple[str | None, str | None]:
     """
     קריאה ל-Gemini API עם מנגנון retry ועיכובים למניעת חריגה ממכסה.
@@ -1005,7 +1005,7 @@ def call_gemini_with_retry(
         try:
             # עיכוב לפני כל קריאה למניעת burst
             if attempt > 0:
-                wait_time = retry_delay * attempt
+                wait_time = retry_delay + (attempt * 15)
                 st.warning(f"⏳ ממתין {wait_time} שניות לפני ניסיון {attempt + 1}/{max_retries}...")
                 time.sleep(wait_time)
             else:
@@ -1053,7 +1053,7 @@ def call_gemini_with_retry(
 def analyze_slides_batch(
     slides_data: list[dict], 
     context_text: str, 
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-1.5-flash",
     batch_size: int = 5
 ) -> list[dict]:
     """
@@ -1139,9 +1139,10 @@ def analyze_slides_batch(
         progress = (batch_idx + 1) / len(batches)
         progress_bar.progress(progress)
         
-        # עיכוב בין אצוות
+        # עיכוב בין אצוות למניעת חריגה ממכסה
         if batch_idx < len(batches) - 1:
-            time.sleep(2)
+            st.caption("⏳ ממתין 5 שניות לפני האצווה הבאה...")
+            time.sleep(5)
     
     progress_bar.empty()
     status_text.empty()
@@ -1160,7 +1161,7 @@ def analyze_slides_batch(
     return sorted(all_results, key=lambda x: x.get("slide_number", 0))
 
 
-def analyze_slides(slides_data: list[dict], context_text: str, model_name: str = "gemini-2.0-flash") -> list[dict]:
+def analyze_slides(slides_data: list[dict], context_text: str, model_name: str = "gemini-1.5-flash") -> list[dict]:
     """
     ניתוח שקפים עם Gemini AI - בחירה אוטומטית בין מצב יחיד לאצוות.
     """
@@ -1170,7 +1171,7 @@ def analyze_slides(slides_data: list[dict], context_text: str, model_name: str =
     # למצגות גדולות - שימוש באצוות
     if total > 10:
         st.info(f"📊 מצגת גדולה ({total} שקפים) - מנתח באצוות למניעת עומס...")
-        return analyze_slides_batch(slides_data, context_text, model_name, batch_size=5)
+        return analyze_slides_batch(slides_data, context_text, model_name, batch_size=3)
     
     # למצגות קטנות - ניתוח בקריאה אחת
     model = genai.GenerativeModel(
@@ -1581,13 +1582,13 @@ def main():
         st.markdown("### 🤖 מודל AI")
         model = st.selectbox(
             "בחירה",
-            ["gemini-2.0-flash", "gemini-1.5-pro-latest", "gemini-1.5-flash-latest"],
+            ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"],
             label_visibility="collapsed"
         )
         model_desc = {
-            "gemini-2.0-flash": "⚡ **מהיר** - מומלץ לרוב המשימות", 
-            "gemini-1.5-pro-latest": "🎯 **מדויק** - לניתוח מעמיק", 
-            "gemini-1.5-flash-latest": "🚀 **קל** - לניתוח מהיר"
+            "gemini-1.5-flash": "⚡ **מומלץ** - מהיר ויציב",
+            "gemini-1.5-pro": "🎯 **מדויק** - לניתוח מעמיק", 
+            "gemini-2.0-flash-exp": "🚀 **ניסיוני** - החדש ביותר"
         }
         st.markdown(model_desc.get(model, ""))
         
