@@ -18,6 +18,7 @@ import json
 import io
 import re
 import zipfile
+import time
 from datetime import datetime
 from lxml import etree
 import uuid
@@ -27,7 +28,7 @@ import copy
 # ============================================================
 # הגדרות API
 # ============================================================
-GEMINI_API_KEY = "AIzaSyBcAax-J6DSaPvbB4vRPt7vuOFALczv5dw"
+GEMINI_API_KEY = "AIzaSyBDY2OE7KPGN5YhphlQ1thEpa-lXEnY6Ts"
 genai.configure(api_key=GEMINI_API_KEY)
 
 
@@ -922,18 +923,202 @@ SYSTEM_PROMPT = """
 """
 
 
+def call_gemini_with_retry(
+    model: genai.GenerativeModel,
+    prompt: str,
+    max_retries: int = 3,
+    base_delay: float = 3.0,
+    retry_delay: float = 15.0
+) -> tuple[str | None, str | None]:
+    """
+    קריאה ל-Gemini API עם מנגנון retry ועיכובים למניעת חריגה ממכסה.
+    
+    Returns:
+        tuple: (response_text, error_message) - אחד מהם יהיה None
+    """
+    
+    for attempt in range(max_retries):
+        try:
+            # עיכוב לפני כל קריאה למניעת burst
+            if attempt > 0:
+                wait_time = retry_delay * attempt
+                st.warning(f"⏳ ממתין {wait_time} שניות לפני ניסיון {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                # עיכוב קטן גם בניסיון ראשון
+                time.sleep(base_delay)
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                    max_output_tokens=16384
+                )
+            )
+            
+            return response.text.strip(), None
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # זיהוי שגיאות rate limit
+            is_rate_limit = any(x in error_msg.lower() for x in [
+                "429", "quota", "resource", "exhausted", "rate", "limit"
+            ])
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                # נסה שוב
+                continue
+            
+            # שגיאות אחרות או מיצינו ניסיונות
+            if "429" in error_msg or "quota" in error_msg.lower() or "resource" in error_msg.lower():
+                return None, "❌ חריגה ממכסת API - נסה מאוחר יותר או החלף מפתח"
+            elif "403" in error_msg and "leaked" in error_msg.lower():
+                return None, "❌ מפתח ה-API דווח כחשוף - צור מפתח חדש ב-Google AI Studio"
+            elif "404" in error_msg:
+                return None, f"❌ מודל לא נמצא - נסה מודל אחר"
+            elif "API_KEY" in error_msg.upper() or "invalid" in error_msg.lower():
+                return None, "❌ מפתח API לא תקין - בדוק את המפתח בקוד"
+            else:
+                return None, f"❌ שגיאת API: {error_msg}"
+    
+    return None, "❌ נכשל לאחר מספר ניסיונות - נסה שוב מאוחר יותר"
+
+
+def analyze_slides_batch(
+    slides_data: list[dict], 
+    context_text: str, 
+    model_name: str = "gemini-2.0-flash",
+    batch_size: int = 5
+) -> list[dict]:
+    """
+    ניתוח שקפים באצוות קטנות למניעת חריגה ממכסה.
+    """
+    
+    total = len(slides_data)
+    all_results = []
+    
+    # יצירת המודל
+    model = genai.GenerativeModel(
+        model_name,
+        system_instruction=SYSTEM_PROMPT
+    )
+    
+    # חלוקה לאצוות
+    batches = [slides_data[i:i + batch_size] for i in range(0, total, batch_size)]
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for batch_idx, batch in enumerate(batches):
+        batch_start = batch[0]["slide_number"]
+        batch_end = batch[-1]["slide_number"]
+        
+        status_text.markdown(f"🔍 **מנתח שקפים {batch_start}-{batch_end}** מתוך {total}...")
+        
+        # הכנת תוכן האצווה
+        slides_content = "\n\n".join([
+            f"=== שקף {s['slide_number']}/{total} ===\n{s['text']}"
+            for s in batch
+        ])
+        
+        user_prompt = f"""
+שיחת פתיחה (Context):
+---
+{context_text}
+---
+
+מצגת לבדיקה (שקפים {batch_start}-{batch_end} מתוך {total}):
+---
+{slides_content}
+---
+
+בצע בדיקה מקצועית לשקפים אלו בלבד והחזר JSON.
+"""
+        
+        # קריאה עם retry
+        response_text, error = call_gemini_with_retry(model, user_prompt)
+        
+        if error:
+            st.error(error)
+            # הוספת שקפים שלא נותחו
+            for slide in batch:
+                all_results.append({
+                    "slide_number": slide["slide_number"],
+                    "original_text": slide["text"][:100],
+                    "ai_comment": "⚠️ לא נותח - שגיאת API",
+                    "status": "לביצוע"
+                })
+        else:
+            # פענוח JSON
+            try:
+                # הסרת backticks אם יש
+                if response_text.startswith("```"):
+                    response_text = re.sub(r'^```json?\s*', '', response_text)
+                    response_text = re.sub(r'\s*```$', '', response_text)
+                
+                batch_results = json.loads(response_text)
+                all_results.extend(batch_results)
+                
+            except json.JSONDecodeError:
+                st.warning(f"⚠️ שגיאה בפענוח תשובה לשקפים {batch_start}-{batch_end}")
+                for slide in batch:
+                    all_results.append({
+                        "slide_number": slide["slide_number"],
+                        "original_text": slide["text"][:100],
+                        "ai_comment": "⚠️ לא נותח - שגיאת פענוח",
+                        "status": "לביצוע"
+                    })
+        
+        # עדכון progress bar
+        progress = (batch_idx + 1) / len(batches)
+        progress_bar.progress(progress)
+        
+        # עיכוב בין אצוות
+        if batch_idx < len(batches) - 1:
+            time.sleep(2)
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # מילוי שקפים חסרים
+    returned = {r.get("slide_number") for r in all_results}
+    for slide in slides_data:
+        if slide["slide_number"] not in returned:
+            all_results.append({
+                "slide_number": slide["slide_number"],
+                "original_text": slide["text"][:100],
+                "ai_comment": "⚠️ לא נותח - יש לסקור ידנית",
+                "status": "לביצוע"
+            })
+    
+    return sorted(all_results, key=lambda x: x.get("slide_number", 0))
+
+
 def analyze_slides(slides_data: list[dict], context_text: str, model_name: str = "gemini-2.0-flash") -> list[dict]:
-    """ניתוח שקפים עם Gemini AI באמצעות System Prompt מקצועי."""
+    """
+    ניתוח שקפים עם Gemini AI - בחירה אוטומטית בין מצב יחיד לאצוות.
+    """
     
     total = len(slides_data)
     
-    # הכנת תוכן השקפים
+    # למצגות גדולות - שימוש באצוות
+    if total > 10:
+        st.info(f"📊 מצגת גדולה ({total} שקפים) - מנתח באצוות למניעת עומס...")
+        return analyze_slides_batch(slides_data, context_text, model_name, batch_size=5)
+    
+    # למצגות קטנות - ניתוח בקריאה אחת
+    model = genai.GenerativeModel(
+        model_name,
+        system_instruction=SYSTEM_PROMPT
+    )
+    
     slides_content = "\n\n".join([
         f"=== שקף {s['slide_number']}/{total} ===\n{s['text']}"
         for s in slides_data
     ])
     
-    # בניית הפרומפט המלא
     user_prompt = f"""
 שיחת פתיחה (Context):
 ---
@@ -947,58 +1132,49 @@ def analyze_slides(slides_data: list[dict], context_text: str, model_name: str =
 
 בצע בדיקה מקצועית לכל {total} השקפים והחזר JSON בלבד.
 """
-
+    
+    progress = st.progress(0)
+    status = st.empty()
+    status.markdown("🔍 **מנתח את המצגת...**")
+    progress.progress(30)
+    
+    response_text, error = call_gemini_with_retry(model, user_prompt)
+    
+    progress.progress(80)
+    
+    if error:
+        st.error(error)
+        progress.empty()
+        status.empty()
+        # החזרת שקפים לא מנותחים
+        return [{
+            "slide_number": s["slide_number"],
+            "original_text": s["text"][:100],
+            "ai_comment": "⚠️ לא נותח - שגיאת API",
+            "status": "לביצוע"
+        } for s in slides_data]
+    
+    # פענוח JSON
     try:
-        model = genai.GenerativeModel(
-            model_name,
-            system_instruction=SYSTEM_PROMPT
-        )
+        if response_text.startswith("```"):
+            response_text = re.sub(r'^```json?\s*', '', response_text)
+            response_text = re.sub(r'\s*```$', '', response_text)
         
-        response = model.generate_content(
-            user_prompt,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.2,
-                max_output_tokens=16384
-            )
-        )
+        result = json.loads(response_text)
         
-        response_text = response.text.strip()
-        
-        # ניסיון לפענח JSON
+    except json.JSONDecodeError:
+        st.warning("⚠️ תשובת AI לא תקינה, מנסה לתקן...")
         try:
-            result = json.loads(response_text)
-        except json.JSONDecodeError as je:
-            # ניסיון לתקן JSON לא שלם
-            st.warning(f"⚠️ תשובת AI לא תקינה, מנסה לתקן...")
-            
-            # הסרת backticks אם יש
-            if response_text.startswith("```"):
-                response_text = re.sub(r'^```json?\s*', '', response_text)
-                response_text = re.sub(r'\s*```$', '', response_text)
-            
-            try:
-                result = json.loads(response_text)
-            except:
-                st.error(f"❌ לא ניתן לפענח תשובת AI")
-                st.code(response_text[:500], language="json")
-                result = []
-                
-    except Exception as e:
-        error_msg = str(e)
-        
-        if "429" in error_msg or "quota" in error_msg.lower() or "resource" in error_msg.lower():
-            st.error("❌ חריגה ממכסת API - נסה מאוחר יותר או החלף מפתח")
-        elif "403" in error_msg and "leaked" in error_msg.lower():
-            st.error("❌ מפתח ה-API דווח כחשוף - צור מפתח חדש ב-Google AI Studio")
-        elif "404" in error_msg:
-            st.error(f"❌ מודל '{model_name}' לא נמצא - נסה מודל אחר")
-        elif "API_KEY" in error_msg.upper() or "invalid" in error_msg.lower():
-            st.error("❌ מפתח API לא תקין - בדוק את המפתח בקוד")
-        else:
-            st.error(f"❌ שגיאת API: {error_msg}")
-        
-        result = []
+            # ניסיון נוסף לפענח
+            result = json.loads(response_text.strip())
+        except:
+            st.error("❌ לא ניתן לפענח תשובת AI")
+            st.code(response_text[:500], language="json")
+            result = []
+    
+    progress.progress(100)
+    progress.empty()
+    status.empty()
     
     # מילוי שקפים חסרים
     returned = {r.get("slide_number") for r in result}
